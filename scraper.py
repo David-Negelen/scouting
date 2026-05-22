@@ -1,191 +1,208 @@
-"""FBref scraping via the soccerdata library."""
+"""Scraper: football-data.org REST API."""
 
+import json
 import logging
 import time
+from pathlib import Path
 from typing import Optional
 
-import pandas as pd
-import soccerdata as sd
-from tqdm import tqdm
+import requests
 
 import config
-from database import (
-    Session,
-    get_engine,
-    get_or_create_player,
-    init_db,
-    upsert_raw_stats,
-)
+from database import Session, get_engine, get_or_create_player, init_db, upsert_raw_stats
 
 log = logging.getLogger(__name__)
 
+BASE_URL = "https://api.football-data.org/v4"
 
-# ── Retry decorator ────────────────────────────────────────────────────────
 
-def _with_retry(fn, *args, **kwargs):
-    """Call *fn* with exponential-backoff retry on any exception."""
-    last_exc: Optional[Exception] = None
+# ── HTTP helper ────────────────────────────────────────────────────────────
+
+def _get(path: str, params: Optional[dict] = None) -> dict:
+    """GET request with retry + rate-limit handling."""
+    url = f"{BASE_URL}{path}"
+    headers = {"X-Auth-Token": config.FOOTBALL_DATA_API_KEY}
+
     for attempt in range(config.RETRY_MAX_ATTEMPTS):
         try:
-            return fn(*args, **kwargs)
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
+            resp = requests.get(url, headers=headers, params=params, timeout=15)
+
+            if resp.status_code == 429:
+                wait = 60
+                print(f"  Rate limit erreicht — warte {wait}s …")
+                time.sleep(wait)
+                continue
+
+            resp.raise_for_status()
+            return resp.json()
+
+        except requests.RequestException as exc:
             wait = config.RETRY_BACKOFF_BASE ** attempt
-            log.warning(
-                "Attempt %d/%d failed (%s). Retrying in %ds…",
-                attempt + 1,
-                config.RETRY_MAX_ATTEMPTS,
-                exc,
-                wait,
-            )
+            print(f"  Fehler (Versuch {attempt+1}/{config.RETRY_MAX_ATTEMPTS}): {exc} — retry in {wait}s")
             time.sleep(wait)
-    raise RuntimeError(
-        f"All {config.RETRY_MAX_ATTEMPTS} attempts failed"
-    ) from last_exc
+
+    raise RuntimeError(f"Alle {config.RETRY_MAX_ATTEMPTS} Versuche fehlgeschlagen: {url}")
 
 
-# ── FBref reader factory ───────────────────────────────────────────────────
+# ── Cache ──────────────────────────────────────────────────────────────────
 
-def _make_reader(leagues: list[str], season: str) -> sd.FBref:
-    return sd.FBref(
-        leagues=leagues,
-        seasons=season,
-        data_dir=config.CACHE_DIR,
-        no_cache=False,
+def _cache_path(league_code: str, season: int, endpoint: str) -> Path:
+    return config.CACHE_DIR / f"{league_code}_{season}_{endpoint}.json"
+
+
+def _load_cache(league_code: str, season: int, endpoint: str) -> Optional[dict]:
+    p = _cache_path(league_code, season, endpoint)
+    if p.exists():
+        return json.loads(p.read_text())
+    return None
+
+
+def _save_cache(league_code: str, season: int, endpoint: str, data: dict) -> None:
+    p = _cache_path(league_code, season, endpoint)
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def _fetch_with_cache(league_code: str, season: int, endpoint: str,
+                      path: str, params: Optional[dict] = None) -> dict:
+    cached = _load_cache(league_code, season, endpoint)
+    if cached is not None:
+        print(f"  (aus Cache geladen)")
+        return cached
+    data = _get(path, params)
+    _save_cache(league_code, season, endpoint, data)
+    return data
+
+
+# ── Scraping ───────────────────────────────────────────────────────────────
+
+def scrape_league(league_code: str, league_name: str, season: int, engine) -> int:
+    """Scrapt Top-Scorer + Team-Stats für eine Liga. Gibt Spieleranzahl zurück."""
+
+    # Top-Scorer ────────────────────────────────────────────────────────────
+    print(f"  Lade Top-Scorer …", end=" ", flush=True)
+    data = _fetch_with_cache(
+        league_code, season, "scorers",
+        f"/competitions/{league_code}/scorers",
+        params={"season": season, "limit": config.SCORERS_LIMIT},
     )
+    scorers = data.get("scorers", [])
+    print(f"{len(scorers)} Spieler")
+    time.sleep(config.REQUEST_DELAY_SECONDS)
 
+    # Teams (für Spieler-Minutenzahlen per Match) ───────────────────────────
+    print(f"  Lade Teams …", end=" ", flush=True)
+    teams_data = _fetch_with_cache(
+        league_code, season, "teams",
+        f"/competitions/{league_code}/teams",
+        params={"season": season},
+    )
+    teams = {t["id"]: t for t in teams_data.get("teams", [])}
+    print(f"{len(teams)} Teams")
+    time.sleep(config.REQUEST_DELAY_SECONDS)
 
-# ── Core scraping logic ────────────────────────────────────────────────────
+    if not scorers:
+        print(f"  !! Keine Daten für {league_name}")
+        return 0
 
-def _extract_fbref_id(index_val) -> str:
-    """FBref player URLs contain a stable hash — use it as the primary key."""
-    # soccerdata exposes the player URL in the index when stat_type includes it;
-    # fall back to a string representation of whatever key is present.
-    if isinstance(index_val, tuple):
-        return str(index_val[-1])
-    return str(index_val)
+    season_str = f"{season}-{season+1}"
+    saved = 0
 
-
-def _parse_player_meta(row: pd.Series, league: str, season: str) -> dict:
-    """Extract player metadata from a stat row."""
-
-    def _safe(col: str):
-        return row.get(col) if col in row.index else None
-
-    age_raw = _safe("age")
-    try:
-        age = int(str(age_raw).split("-")[0]) if age_raw else None
-    except (ValueError, AttributeError):
-        age = None
-
-    return {
-        "name": _safe("player") or _safe("Player") or "Unknown",
-        "age": age,
-        "nationality": _safe("nationality") or _safe("nation"),
-        "position": _safe("position") or _safe("pos"),
-        "club": _safe("squad") or _safe("team"),
-        "league": league,
-        "season": season,
-    }
-
-
-def scrape_league(
-    league: str,
-    season: str,
-    categories: Optional[list[str]] = None,
-    engine=None,
-) -> None:
-    """Scrape all configured stat categories for one league/season pair."""
-    if categories is None:
-        categories = config.FBREF_CATEGORIES
-    if engine is None:
-        engine = get_engine()
-
-    fbref = _make_reader([league], season)
-
-    total_cats = len(categories)
     with Session(engine) as session:
-        for cat_idx, category in enumerate(categories, 1):
-            print(f"  [{cat_idx}/{total_cats}] {category} ...", end=" ", flush=True)
+        for entry in scorers:
+            p = entry.get("player", {})
+            team = entry.get("team", {})
 
-            try:
-                df: pd.DataFrame = _with_retry(
-                    fbref.read_player_season_stats, stat_type=category
-                )
-            except RuntimeError as exc:
-                print(f"FEHLER ({exc})")
-                log.error("Skipping %s / %s: %s", category, league, exc)
-                time.sleep(config.REQUEST_DELAY_SECONDS)
+            player_id_ext = str(p.get("id", ""))
+            if not player_id_ext:
                 continue
 
-            if df is None or df.empty:
-                print("keine Daten")
-                log.warning("No data returned for %s / %s / %s", category, league, season)
-                time.sleep(config.REQUEST_DELAY_SECONDS)
-                continue
+            # Minuten schätzen: playedMatches * 90 (konservativ)
+            played = entry.get("playedMatches", 0) or 0
+            minutes = played * 90
 
-            # Flatten MultiIndex columns (soccerdata uses them)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [
-                    "_".join(filter(None, map(str, col))).strip("_").lower()
-                    for col in df.columns
-                ]
-            else:
-                df.columns = [str(c).strip().lower() for c in df.columns]
+            meta = {
+                "name": p.get("name") or p.get("shortName") or "Unknown",
+                "age": _calc_age(p.get("dateOfBirth")),
+                "nationality": p.get("nationality"),
+                "position": _map_position(p.get("position")),
+                "club": team.get("shortName") or team.get("name"),
+                "league": league_name,
+                "season": season_str,
+            }
 
-            # Reset index to expose player/squad columns
-            df = df.reset_index()
+            player = get_or_create_player(session, fbref_id=player_id_ext, meta=meta)
 
-            saved = 0
-            for _, row in df.iterrows():
-                player_key = f"{row.get('player', '')}_{row.get('squad', '')}".strip("_")
-                if not player_key:
-                    continue
+            stats = {
+                "goals":        _safe_int(entry.get("goals")),
+                "assists":      _safe_int(entry.get("assists")),
+                "penalties":    _safe_int(entry.get("penalties")),
+                "played_matches": played,
+            }
 
-                meta = _parse_player_meta(row, league, season)
-                player = get_or_create_player(session, fbref_id=player_key, meta=meta)
+            upsert_raw_stats(
+                session,
+                player_id=player.id,
+                season=season_str,
+                category="scorers",
+                minutes=float(minutes),
+                stats=stats,
+            )
+            saved += 1
 
-                # Minutes — check several possible column names
-                minutes_col = next(
-                    (c for c in ["minutes", "min", "mins", "playing_time_min"] if c in row.index),
-                    None,
-                )
-                minutes = float(row[minutes_col]) if minutes_col and pd.notna(row[minutes_col]) else 0.0
+        session.commit()
 
-                # Collect numeric stat columns (exclude metadata)
-                stat_cols = [
-                    c for c in row.index
-                    if c not in config.NON_STAT_COLUMNS
-                    and pd.api.types.is_numeric_dtype(type(row[c]))
-                ]
-                stats = {
-                    col: (None if pd.isna(row[col]) else float(row[col]))
-                    for col in stat_cols
-                }
+    return saved
 
-                upsert_raw_stats(
-                    session,
-                    player_id=player.id,
-                    season=season,
-                    category=category,
-                    minutes=minutes,
-                    stats=stats,
-                )
-                saved += 1
 
-            session.commit()
-            print(f"{saved} Spieler gespeichert")
-            time.sleep(config.REQUEST_DELAY_SECONDS)
+# ── Helpers ────────────────────────────────────────────────────────────────
 
-    print(f"  -> {league} {season} abgeschlossen")
+def _safe_int(val) -> Optional[int]:
+    try:
+        return int(val) if val is not None else None
+    except (TypeError, ValueError):
+        return None
 
+
+def _calc_age(dob: Optional[str]) -> Optional[int]:
+    if not dob:
+        return None
+    try:
+        from datetime import date
+        birth = date.fromisoformat(dob[:10])
+        today = date.today()
+        return today.year - birth.year - ((today.month, today.day) < (birth.month, birth.day))
+    except Exception:
+        return None
+
+
+_POS_MAP = {
+    "Goalkeeper":   "GK",
+    "Defender":     "DF",
+    "Midfielder":   "MF",
+    "Offence":      "FW",
+    "Forward":      "FW",
+    "Attacker":     "FW",
+}
+
+
+def _map_position(pos: Optional[str]) -> Optional[str]:
+    if not pos:
+        return None
+    return _POS_MAP.get(pos, pos)
+
+
+# ── Entry point ────────────────────────────────────────────────────────────
 
 def scrape_all(
-    leagues: Optional[list[str]] = None,
-    season: Optional[str] = None,
-    categories: Optional[list[str]] = None,
+    leagues: Optional[dict] = None,
+    season: Optional[int] = None,
 ) -> None:
-    """Entry point: scrape every configured league."""
+    if config.FOOTBALL_DATA_API_KEY == "DEIN_API_KEY_HIER":
+        print("\n!! KEIN API KEY gesetzt!")
+        print("   -> config.py öffnen und FOOTBALL_DATA_API_KEY eintragen")
+        print("   -> Kostenlos registrieren: https://www.football-data.org/client/register\n")
+        return
+
     if leagues is None:
         leagues = config.LEAGUES
     if season is None:
@@ -195,10 +212,11 @@ def scrape_all(
     init_db(engine)
 
     total = len(leagues)
-    for i, league in enumerate(leagues, 1):
-        print(f"\n  Liga {i}/{total}: {league}")
+    for i, (code, name) in enumerate(leagues.items(), 1):
+        print(f"\n  Liga {i}/{total}: {name} ({code})")
         try:
-            scrape_league(league, season, categories=categories, engine=engine)
-        except Exception as exc:  # noqa: BLE001
-            print(f"  !! Liga {league} komplett fehlgeschlagen: {exc}")
-            log.error("League %s failed entirely: %s", league, exc)
+            n = scrape_league(code, name, season, engine)
+            print(f"  -> {n} Spieler gespeichert")
+        except Exception as exc:
+            print(f"  !! Fehler bei {name}: {exc}")
+            log.error("League %s failed: %s", name, exc)

@@ -79,11 +79,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def cmd_scrape(args) -> None:
-    scrape_all(
-        leagues=args.leagues,
-        season=args.season,
-        categories=args.categories,
-    )
+    leagues = None
+    if args.leagues:
+        leagues = {code: name for code, name in config.LEAGUES.items()
+                   if code in args.leagues or name in args.leagues}
+    season = int(args.season) if args.season else None
+    scrape_all(leagues=leagues, season=season)
 
 
 def cmd_normalise(args) -> None:
@@ -99,29 +100,40 @@ def cmd_score(args) -> None:
 
 def cmd_run_all(args) -> None:
     import time
-    season = args.season or config.SEASON
-    leagues = args.leagues or config.LEAGUES
+
+    # Leagues: wenn per CLI angegeben, als Code-Liste filtern
+    if args.leagues:
+        leagues = {code: name for code, name in config.LEAGUES.items()
+                   if code in args.leagues or name in args.leagues}
+        if not leagues:
+            print(f"Unbekannte Liga-Codes. Verfügbar: {list(config.LEAGUES.keys())}")
+            return
+    else:
+        leagues = config.LEAGUES
+
+    season = int(args.season) if args.season else config.SEASON
+    season_str = f"{season}-{season+1}"
     t0 = time.time()
 
     print(f"\n{'='*60}")
     print(f"  Scouting Pipeline")
-    print(f"  Saison : {season}")
-    print(f"  Ligen  : {', '.join(leagues)}")
+    print(f"  Saison : {season_str}")
+    print(f"  Ligen  : {', '.join(leagues.values())}")
     print(f"{'='*60}\n")
 
     engine = get_engine()
     init_db(engine)
 
-    print("[1/3] SCRAPING — Daten von FBref laden ...")
-    scrape_all(leagues=leagues, season=season, categories=args.categories)
+    print("[1/3] SCRAPING — Daten von football-data.org laden ...")
+    scrape_all(leagues=leagues, season=season)
     print(f"      -> Scraping abgeschlossen ({time.time()-t0:.0f}s)\n")
 
     print("[2/3] NORMALISIERUNG — Per-90-Werte berechnen ...")
-    normalise_all(season=season, engine=engine)
+    normalise_all(season=season_str, engine=engine)
     print(f"      -> Normalisierung abgeschlossen ({time.time()-t0:.0f}s)\n")
 
     print("[3/3] SCORING — Talent-Scores berechnen ...")
-    score_all(season=season, engine=engine)
+    score_all(season=season_str, engine=engine)
     print(f"      -> Scoring abgeschlossen ({time.time()-t0:.0f}s)\n")
 
     print(f"{'='*60}")
