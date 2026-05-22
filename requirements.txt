@@ -1,0 +1,13 @@
+# ── Core scouting stack ────────────────────────────────────────────────────
+soccerdata>=1.0.0          # FBref wrapper
+pandas>=2.1.0
+numpy>=1.26.0
+SQLAlchemy>=2.0.0
+
+# ── Progress & CLI ─────────────────────────────────────────────────────────
+tqdm>=4.66.0
+
+# ── soccerdata optional but recommended deps ───────────────────────────────
+requests>=2.31.0
+lxml>=5.0.0                # HTML parsing for soccerdata
+unidecode>=1.3.0           # name normalisation used by soccerdata
