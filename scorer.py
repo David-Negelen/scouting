@@ -2,6 +2,7 @@
 
 import json
 import logging
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -33,7 +34,7 @@ _FALLBACK_PREFIX = {
 }
 
 
-def _position_group(position: str | None) -> str | None:
+def _position_group(position: Optional[str]) -> Optional[str]:
     if not position:
         return None
     pos = str(position).upper().strip().split(",")[0].strip()
@@ -86,7 +87,7 @@ def _score_group(
 
 # ── Main scoring pipeline ──────────────────────────────────────────────────
 
-def score_all(season: str | None = None, engine=None) -> None:
+def score_all(season: Optional[str] = None, engine=None) -> None:
     if season is None:
         season = config.SEASON
     if engine is None:

@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+from typing import Optional
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -75,7 +76,7 @@ def _normalise(stats: dict[str, Any], minutes: float) -> dict[str, Any]:
 
 # ── Main normalisation pipeline ────────────────────────────────────────────
 
-def normalise_all(season: str | None = None, engine=None) -> None:
+def normalise_all(season: Optional[str] = None, engine=None) -> None:
     """Read raw stats from DB, normalise, write per-90 rows."""
     if season is None:
         season = config.SEASON
