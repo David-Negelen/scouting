@@ -114,19 +114,23 @@ def score_all(season: Optional[str] = None, engine=None) -> None:
     for pos_group, weights in config.SCORING_WEIGHTS.items():
         subset = df[df["position_group"] == pos_group].copy()
         if subset.empty:
+            print(f"  {pos_group}: keine Spieler")
             continue
         result = _score_group(subset, pos_group, weights)
         if not result.empty:
             scored_rows.append(result)
+            print(f"  {pos_group}: {len(subset)} Spieler bewertet")
+        else:
+            print(f"  {pos_group}: keine Scoring-Spalten verfügbar")
 
     if not scored_rows:
-        log.warning("No scores computed.")
+        print("  !! Keine Scores berechnet.")
         return
 
     all_scores = pd.concat(scored_rows, ignore_index=True)
 
     with Session(engine) as session:
-        for _, row in tqdm(all_scores.iterrows(), total=len(all_scores), desc="Saving scores"):
+        for _, row in tqdm(all_scores.iterrows(), total=len(all_scores), desc="  Scores speichern"):
             if pd.isna(row["player_id"]):
                 continue
             upsert_score(
@@ -139,4 +143,4 @@ def score_all(season: Optional[str] = None, engine=None) -> None:
             )
         session.commit()
 
-    log.info("Scoring complete for %d players.", len(all_scores))
+    print(f"  -> {len(all_scores)} Spieler mit Talent-Score gespeichert")

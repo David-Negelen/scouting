@@ -94,8 +94,10 @@ def normalise_all(season: Optional[str] = None, engine=None) -> None:
 
         skipped = 0
         processed = 0
+        total = len(players)
+        print(f"  {total} Spieler in der DB gefunden")
 
-        for player in tqdm(players, desc="Normalising", unit="player"):
+        for player in tqdm(players, desc="  Per-90 berechnen", unit="Spieler"):
             raw_rows = [r for r in player.raw_stats if r.season == season]
             if not raw_rows:
                 continue
@@ -103,12 +105,6 @@ def normalise_all(season: Optional[str] = None, engine=None) -> None:
             minutes, merged_stats = _merge_categories(raw_rows)
 
             if minutes < config.MIN_MINUTES:
-                log.debug(
-                    "Skipping %s — only %.0f min (threshold: %d)",
-                    player.name,
-                    minutes,
-                    config.MIN_MINUTES,
-                )
                 skipped += 1
                 continue
 
@@ -125,9 +121,4 @@ def normalise_all(season: Optional[str] = None, engine=None) -> None:
 
         session.commit()
 
-    log.info(
-        "Normalisation complete — %d players processed, %d skipped (< %d min)",
-        processed,
-        skipped,
-        config.MIN_MINUTES,
-    )
+    print(f"  -> {processed} Spieler normalisiert, {skipped} übersprungen (< {config.MIN_MINUTES} Min.)")

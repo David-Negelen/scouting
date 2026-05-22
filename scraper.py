@@ -103,20 +103,23 @@ def scrape_league(
 
     fbref = _make_reader([league], season)
 
+    total_cats = len(categories)
     with Session(engine) as session:
-        for category in tqdm(categories, desc=f"{league} {season}", unit="cat"):
-            log.info("Scraping category '%s' for %s %s", category, league, season)
+        for cat_idx, category in enumerate(categories, 1):
+            print(f"  [{cat_idx}/{total_cats}] {category} ...", end=" ", flush=True)
 
             try:
                 df: pd.DataFrame = _with_retry(
                     fbref.read_player_season_stats, stat_type=category
                 )
             except RuntimeError as exc:
+                print(f"FEHLER ({exc})")
                 log.error("Skipping %s / %s: %s", category, league, exc)
                 time.sleep(config.REQUEST_DELAY_SECONDS)
                 continue
 
             if df is None or df.empty:
+                print("keine Daten")
                 log.warning("No data returned for %s / %s / %s", category, league, season)
                 time.sleep(config.REQUEST_DELAY_SECONDS)
                 continue
@@ -133,9 +136,8 @@ def scrape_league(
             # Reset index to expose player/squad columns
             df = df.reset_index()
 
+            saved = 0
             for _, row in df.iterrows():
-                # Build a stable player ID from name + squad (FBref ID in URL
-                # is the gold standard but not always surfaced by soccerdata)
                 player_key = f"{row.get('player', '')}_{row.get('squad', '')}".strip("_")
                 if not player_key:
                     continue
@@ -169,11 +171,13 @@ def scrape_league(
                     minutes=minutes,
                     stats=stats,
                 )
+                saved += 1
 
             session.commit()
+            print(f"{saved} Spieler gespeichert")
             time.sleep(config.REQUEST_DELAY_SECONDS)
 
-    log.info("Finished scraping %s %s", league, season)
+    print(f"  -> {league} {season} abgeschlossen")
 
 
 def scrape_all(
@@ -190,8 +194,11 @@ def scrape_all(
     engine = get_engine()
     init_db(engine)
 
-    for league in tqdm(leagues, desc="Leagues", unit="league"):
+    total = len(leagues)
+    for i, league in enumerate(leagues, 1):
+        print(f"\n  Liga {i}/{total}: {league}")
         try:
             scrape_league(league, season, categories=categories, engine=engine)
         except Exception as exc:  # noqa: BLE001
+            print(f"  !! Liga {league} komplett fehlgeschlagen: {exc}")
             log.error("League %s failed entirely: %s", league, exc)

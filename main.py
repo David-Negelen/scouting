@@ -98,11 +98,36 @@ def cmd_score(args) -> None:
 
 
 def cmd_run_all(args) -> None:
+    import time
+    season = args.season or config.SEASON
+    leagues = args.leagues or config.LEAGUES
+    t0 = time.time()
+
+    print(f"\n{'='*60}")
+    print(f"  Scouting Pipeline")
+    print(f"  Saison : {season}")
+    print(f"  Ligen  : {', '.join(leagues)}")
+    print(f"{'='*60}\n")
+
     engine = get_engine()
     init_db(engine)
-    scrape_all(leagues=args.leagues, season=args.season, categories=args.categories)
-    normalise_all(season=args.season, engine=engine)
-    score_all(season=args.season, engine=engine)
+
+    print("[1/3] SCRAPING — Daten von FBref laden ...")
+    scrape_all(leagues=leagues, season=season, categories=args.categories)
+    print(f"      -> Scraping abgeschlossen ({time.time()-t0:.0f}s)\n")
+
+    print("[2/3] NORMALISIERUNG — Per-90-Werte berechnen ...")
+    normalise_all(season=season, engine=engine)
+    print(f"      -> Normalisierung abgeschlossen ({time.time()-t0:.0f}s)\n")
+
+    print("[3/3] SCORING — Talent-Scores berechnen ...")
+    score_all(season=season, engine=engine)
+    print(f"      -> Scoring abgeschlossen ({time.time()-t0:.0f}s)\n")
+
+    print(f"{'='*60}")
+    print(f"  Pipeline fertig in {time.time()-t0:.0f}s")
+    print(f"  Ergebnisse anzeigen: python main.py show --top 20")
+    print(f"{'='*60}\n")
 
 
 def cmd_show(args) -> None:
